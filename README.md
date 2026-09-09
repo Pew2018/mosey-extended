@@ -1,918 +1,686 @@
-> [!WARNING]
-> This project is independent and not affiliated with, authorized, or endorsed by Google LLC or Apple Inc.  
-> All trademarks (including Android, Google, and AirDrop) belong to their respective owners.
-
-> [!IMPORTANT]
-> **HELP WANTED! ПРОЕКТУ НУЖНА ПОМОЩЬ!**  
-> If you own (or know someone who owns) Pixel 9 or Pixel 10 series device (excluding 9a) or any other device that supports Airdrop (Galaxy S24-26, some BBK devices) and willing to help this project – proceed to [AIRDROP TESTING GUIDE](./MOSEY_CAPTURE_TEST_SUITE.md )
-> 
-> Если у вас (или ваших знакомых) есть Pixel 9/10 (не считая 9a) или любое другое устройство поддерживающее Airdrop (Galaxy S24-26, пара устройств от BBK) и желание помочь проекту – прочтите [ГАЙД ПО ТЕСТИРОВАНИЮ AIRDROP](./MOSEY_CAPTURE_TEST_SUITE_RU.md )
-
-
-<h1 align="center">Mosey Extended v2 (MMT-Ex)</h1>
-
-<div align="center">
-  <img src="https://img.shields.io/badge/Version-v2.2-blue.svg?longCache=true&style=popout-square" alt="Version" />
-  <img src="https://img.shields.io/badge/Updated-May 25, 2026-green.svg?longCache=true&style=flat-square" alt="Updated" />
-  <img src="https://img.shields.io/badge/MinMagisk-20.4-red.svg?longCache=true&style=flat-square" alt="MinMagisk" />
-  <img src="https://img.shields.io/badge/MinKernelSU-0.6.6-red.svg?longCache=true&style=flat-square" alt="MinKSU" />
-</div>
-
-<p align="center">
-  <a href="#english">English</a> · <a href="#русский">Русский</a>
-</p>
-
----
-
-<a id="english"></a>
-
-# English
-
-> [!CAUTION]
-> **EXPERIMENTAL AND IN ACTIVE DEVELOPMENT!**
-> 
-> **FLASH ANY MODULES AT YOUR OWN RISK!** You **MUST** know exactly what you are doing.  
-> For research and debugging purposes only.  
-
-## Table of Contents
-
-1. [What is this?](#1-what-is-this)
-2. [How AirDrop (mosey) works — full stack](#2-how-airdrop-mosey-works--full-stack)
-3. [Full modification tree](#3-full-modification-tree)
-4. [Supported devices & Wi-Fi modems](#4-supported-devices--wi-fi-modems)
-5. [Key files location table](#5-key-files-location-table)
-6. [Current status](#6-current-status)
-7. [Build: wonder\_mosey\_wild.ko](#7-build-wonder_mosey_wildko)
-8. [Deployment & service.sh integration](#8-deployment--servicesh-integration)
-9. [Known limitations](#9-known-limitations)
-
----
-
-## 1. What is this?
-
-A few weeks ago, I reverse-engineered a Pixel 10 firmware image and identified
-the missing component required to enable AirDrop-style functionality in Google
-Quick Share on older Pixel devices — and potentially any Android device.
-
-I found a native binary named **`mosey_server`** (matching the APK extension
-component for Quick Share). Static analysis shows it is a native Android
-service, not a CLI tool. It links against `libbinder_ndk.so`, `liblog.so`,
-`libc.so`, and `libdl.so`, and contains the string
-`AServiceManager_addService`. The embedded source path
-`vendor/google/services/QuickShareExtension/src/server.rs` confirms it is part
-of the Quick Share extension and is expected to start at boot.
-
-The binary attempts to register a native AIDL (NDK Binder) service via
-`AServiceManager_addService("com.google.pixel.service.IService/default")`.
-
-Initial attempts to inject and run this binary via KSU module failed because:
-1. `AServiceManager_addService()` requires more than just SELinux `allow` rules.
-2. The service name must be mapped to a valid SELinux service type in
-   `vendor_service_contexts`.
-3. Without that mapping, registration fails with `PERMISSION_DENIED` or
-   `UNKNOWN_ERROR`.
-
-The Pixel 10 vendor image includes all required components. This project
-transplants them — along with a virtual "wonder" Wi-Fi phy — so that
-`mosey_server` can run on any rooted Android device.
-
----
-
-## 2. How AirDrop (mosey) works — full stack
-
-Google's "AirDrop" (internal codename **mosey**) in Quick Share requires a
-specific Wi-Fi interface named `wonder` to be present on the device. The
-`mosey_server` native service communicates with this interface through the
-Linux `cfg80211`/`nl80211` subsystem.
-
-The full boot sequence:
-
-```
-Boot
- └─ init parses mosey.rc
-     └─ starts mosey_server (NET_ADMIN, NET_RAW caps)
-         ├─ registers "com.google.pixel.service.IService/default" with servicemanager
-         ├─ sends NL80211_CMD_NEW_INTERFACE to create "wonder0" (MONITOR mode)
-         ├─ sets channel 149 / 5745 MHz via NL80211_CMD_SET_CHANNEL
-         ├─ sends NL80211 vendor commands (vendor_id=0x1A11):
-         │   ├─ subcmd 1: set_frequency
-         │   ├─ subcmd 2: set_filter
-         │   ├─ subcmd 3: set_fixed_tx_rate
-         │   ├─ subcmd 4: set_reg
-         │   └─ subcmd 5: get_if_mac_addr → reads 6-byte MAC
-         └─ opens PF_PACKET / TPACKET_V3 on wonder0 for 802.11 frame I/O
-```
-
-On Pixel 9 / 10, this chain works natively via the BCM4398 chip's
-`wondertap` mechanism inside `bcmdhd`. On older Pixels (7/8) and non-Pixel
-devices, this project provides the missing pieces:
-
-- **`wonder_mosey_wild.ko`** — a standalone virtual mac80211 driver that
-  creates the `wonder` phy and handles all vendor commands natively.
-- **SELinux policy** — extracted from Pixel 10, injected via KSU `sepolicy.rule`.
-- **`mosey.rc`** — init service definition, overlaid via KSU module.
-
----
-
-## 3. Full modification tree
-
-The following tree lists every layer that must be modified or provided to
-bring AirDrop online, from high-level feature flags down to the modem driver.
-Items marked ✅ are handled by this module; ⚠️ indicates partial / in-progress;
-❌ indicates not yet implemented.
-
-```
-AirDrop (mosey Quick Share) — Full Stack
-│
-├── [Layer 0] Phenotype / Feature Flags                          ✅
-│   ├── pixel_experience_YYYY.xml
-│   │   └── com.google.android.feature.PIXEL_XXXX_EXPERIENCE
-│   │       declares the device as Pixel-class to GMS
-│   ├── phenotype.db
-│   │   └── NearbyShare / QuickShare feature gates
-│   └── payload/pixel_experience_*.xml
-│       └── injected via KSU module overlay (install.sh)
-│
-├── [Layer 1] APK / GMS                                          ✅ (GMS managed)
-│   ├── com.google.android.gms — Nearby/Quick Share core service
-│   ├── com.google.android.apps.nearby.sharewidget — Quick Share UI
-│   └── MoseyApp — vendor Quick Share extension APK
-│
-├── [Layer 2] Native Binary                                      ✅
-│   └── /vendor/bin/mosey_server
-│       ├── Language: Rust (embedded source path confirms)
-│       ├── Links: libbinder_ndk, liblog, libc, libdl
-│       └── Binder service: "com.google.pixel.service.IService/default"
-│
-├── [Layer 3] Init / Service Management                          ✅
-│   └── /vendor/etc/init/mosey.rc
-│       ├── on boot: start mosey_server
-│       ├── user system, group system inet
-│       └── capabilities: NET_ADMIN NET_RAW
-│
-├── [Layer 4] SELinux Policy                                     ✅ (partial)
-│   ├── vendor_service_contexts
-│   │   └── maps "com.google.pixel.service.IService/default" → mosey_service
-│   ├── vendor_sepolicy.cil
-│   │   └── allow rules: mosey_server domain permissions
-│   ├── vendor_file_contexts
-│   │   └── /vendor/bin/mosey_server → u:object_r:mosey_exec:s0
-│   ├── product_sepolicy.cil
-│   │   └── mosey_app domain, typeattributeset rules
-│   ├── system_ext_sepolicy.cil
-│   │   └── system_ext mosey rules
-│   ├── system_ext_seapp_contexts
-│   │   └── app package → SELinux domain mapping
-│   └── 202504.cil
-│       └── API-level compatibility mapping (API 36 / Android 16)
-│
-├── [Layer 5] Wi-Fi Interface ("wonder" phy)                    ⚠️ (build in progress)
-│   ├── cfg80211 phy named "wonder"
-│   │   └── renamed via: iw phy phyN set name wonder
-│   ├── wonder0 — MONITOR mode interface (NL80211_CMD_NEW_INTERFACE)
-│   ├── channel: 149 / 5745 MHz (5 GHz band)
-│   └── NL80211 vendor commands (vendor_id = 0x001A11):
-│       ├── subcmd 1: set_frequency  → noop (return 0)
-│       ├── subcmd 2: set_filter     → noop (return 0)
-│       ├── subcmd 3: set_fixed_tx_rate → noop (return 0)
-│       ├── subcmd 4: set_reg        → noop (return 0)
-│       └── subcmd 5: get_if_mac_addr → returns 6-byte MAC via NL attr
-│
-├── [Layer 6] Kernel Module                                      ⚠️ (build in progress)
-│   │
-│   ├── Option A — Native (Samsung wonder.ko) [Pixel 9+, S24 Exynos only]
-│   │   ├── BCM wondertap interface to bcmdhd driver
-│   │   ├── Requires: "wondertap-provider" DT phandle in device tree
-│   │   ├── Requires: BCM4398 chip + bcmdhd with wondertap symbols
-│   │   └── Available pre-built: kernel 6.1.145 (Pixel 9), 6.1.157 (S24 Exynos)
-│   │
-│   └── Option B — Standalone (wonder_mosey_wild.ko) ← THIS PROJECT
-│       ├── Virtual mac80211 driver, no hardware dependency
-│       ├── Satisfies full NL80211 init sequence natively
-│       ├── Kernel: android14-6.1-2025-09 + Wild KSU patches
-│       ├── vermagic: 6.1.145-android14-11-Wild-Exclusive
-│       └── Runs on any KSU/Magisk-rooted device (virtual phy, no real RF)
-│
-└── [Layer 7] Wi-Fi Driver / Modem Firmware                     device-specific
-    ├── BCM4398 (Pixel 9/10, Samsung Galaxy S24 Exynos)
-    │   ├── bcmdhd4390.ko with native wondertap
-    │   └── Full RF: real 802.11 frame TX/RX via wonder0
-    ├── BCM4389 (Pixel 7/8, Pixel Fold)
-    │   ├── bcmdhd without native wondertap
-    │   └── wonder_mosey_wild.ko provides virtual phy (no real RF)
-    ├── Qualcomm FastConnect (Samsung S24/S25 Snapdragon, OnePlus, etc.)
-    │   └── No wondertap; standalone virtual phy only via this module
-    └── MediaTek MT7925 (OPPO Find X8, Vivo X200, Xiaomi 15)
-        └── No wondertap; standalone virtual phy only via this module
-```
-
----
-
-## 4. Supported devices & Wi-Fi modems
-
-> **Column key**
-> - **Native wonder** — device ships with BCM wondertap support in bcmdhd + wonder.ko
-> - **Virtual phy** — `wonder_mosey_wild.ko` can provide the wonder interface (no real RF)
-> - **mosey_server** — binary sourced from Pixel 10 vendor image; SELinux transplant required on all non-Pixel-10 devices
-
-### Google Pixel
-
-| Device name | Codename | SoC | Wi-Fi module | Native wonder | Virtual phy | Note |
-|------------|-------------|-----|-----------|:---:|:---:|------------|
-| Pixel 10 Pro XL | mustang | Tensor G5 | BCM4398 |  ✅ | ✅ | Oficiall support |
-| Pixel 10 Pro | blazer | Tensor G5 | BCM4398 | ✅ | ✅ | Oficiall support  |
-| Pixel 10 | frankel | Tensor G5 | BCM4398 |  ✅ | ✅ | Oficiall support |
-| Pixel 9 Pro XL | komodo | Tensor G4 | BCM4390 |  ✅ | ✅ | Oficiall support, bcmdhd4390.ko has wondertap |
-| Pixel 9 Pro | caiman | Tensor G4 | BCM4390 |  ✅ | ✅ | Oficiall support, bcmdhd4390.ko has wondertap |
-| Pixel 9 Pro Fold | comet | Tensor G4 | BCM4390 |  ✅ | ✅ | Oficiall support, bcmdhd4390.ko has wondertap |
-| Pixel 9 | tokay | Tensor G4 | BCM4390 | ✅ | ✅ | Oficiall support  |
-| Pixel 9a | tegu | Tensor G4 | BCM4389 | ❌ | ? | – |
-| Pixel 8 Pro | husky | Tensor G3 | BCM4389 |  ❌ | ✅ | Main target |
-| Pixel 8 | shiba | Tensor G3 | BCM4389 | ❌ | ✅ | – |
-| Pixel 8a | akita | Tensor G3 | BCM4383 | ❌ | ✅ | – |
-| Pixel 7 Pro | cheetah | Tensor G2 | BCM4389 | ❌ | ✅ | – |
-| Pixel 7 | panther | Tensor G2 | BCM4389 | ❌ | ✅ | – |
-| Pixel 7a | lynx | Tensor G2 | BCM4389 | ❌ | ✅ | – |
-| Pixel Fold | felix | Tensor G2 | BCM4389 | ❌ | ✅ | – |
-
-### Samsung Galaxy S
-
-| Device name  | SoC | Wi-Fi module |  Native wonder | Virtual phy | Note |
-|------------|-----|-----------|:---:|:---:|------------|
-| Galaxy S24 |  Exynos 2400 | BCM4398 | ✅ | ✅ | wonder.ko kernel 6.1.157 found|
-| Galaxy S24+| Exynos 2400 | BCM4398 |  ✅ | ✅ | Same as S24 Exynos |
-| Galaxy S24 |  Snapdragon 8 Gen 3 | Qualcomm WCN685x |  ✅ | ✅ | – |
-| Galaxy S24+ | Snapdragon 8 Gen 3 | Qualcomm WCN685x | | ✅ | ✅ | — |
-| Galaxy S24 Ultra |  Snapdragon 8 Gen 3 | Qualcomm WCN685x |  ✅ | ✅ | – |
-| Galaxy S25 |  Snapdragon 8 Elite | Qualcomm FastConnect 7900 | ✅ | ✅ | – |
-| Galaxy S25+ |  Snapdragon 8 Elite | Qualcomm FastConnect 7900 | ✅ | ✅ | — |
-| Galaxy S25 Ultra | Snapdragon 8 Elite | Qualcomm FastConnect 7900 |  ✅ | ✅ | — |
-
-### BBK
-
-| Device | SoC | Wi-Fi module |  Native wonder | Virtual phy | Note |
-|------------|-----|-----------|:---:|:---:|------------|
-| Vivo X300 Pro | Dimensity 9500 | MediaTek MT6993 | ✅ | ✅ | — |
-| OPPO Find X8 Pro | Dimensity 9400 | MediaTek MT7925 | ✅ | ✅ | — |
-| OPPO Find X8 Ultra | Dimensity 9400 | MediaTek MT7925 | ✅ | ✅ | — |
-
-> **Note on virtual phy**: `wonder_mosey_wild.ko` creates a valid `wonder0` interface and satisfies
-> `mosey_server`'s full NL80211 init sequence. However, without native BCM wondertap, real
-> 802.11 frame I/O will not work — proximity discovery via 802.11 scanning is unavailable.
-> BLE-based discovery may still function. This is the current limitation of all non-BCM devices.
-
----
-
-## 5. Key files location table
-
-Files relevant to mosey — sourced from the Pixel 10 vendor image unless noted.
-All paths are device-side (post-overlay).
-
-| File | Partition | Device Path | Purpose | Source |
-|------|-----------|-------------|---------|--------|
-| `mosey_server` | vendor | `/vendor/bin/mosey_server` | Native AirDrop service binary (Rust) | Pixel 10 factory image |
-| `mosey.rc` | vendor | `/vendor/etc/init/mosey.rc` | init service definition | Pixel 10 / this module |
-| `vendor_service_contexts` | vendor | `/vendor/etc/selinux/vendor_service_contexts` | Binder service → SELinux type mapping | Pixel 10 vendor image |
-| `vendor_sepolicy.cil` | vendor | `/vendor/etc/selinux/vendor_sepolicy.cil` | mosey_server allow rules | Pixel 10 vendor image |
-| `vendor_file_contexts` | vendor | `/vendor/etc/selinux/vendor_file_contexts` | `/vendor/bin/mosey_server` file label | Pixel 10 vendor image |
-| `product_sepolicy.cil` | product | `/product/etc/selinux/product_sepolicy.cil` | mosey_app domain rules | Pixel 10 product image |
-| `system_ext_sepolicy.cil` | system_ext | `/system_ext/etc/selinux/system_ext_sepolicy.cil` | system_ext mosey rules | Pixel 10 system_ext |
-| `system_ext_seapp_contexts` | system_ext | `/system_ext/etc/selinux/system_ext_seapp_contexts` | App package → SELinux domain | Pixel 10 system_ext |
-| `202504.cil` | system | `/system/etc/selinux/mapping/202504.cil` | API 36 / Android 16 compat mapping | Pixel 10 system image |
-| `compatibility_matrix.xml` | system | `/system/compatibility_matrix.device.xml` | HAL + kernel compat requirements | Pixel 10 system image |
-| `pixel_experience_YYYY.xml` | system | `/system/etc/permissions/pixel_experience_YYYY.xml` | GMS feature declarations | This module (`payload/`) |
-| `sepolicy.rule` | module | `$MODDIR/sepolicy.rule` | KSU runtime policy additions | This module |
-| `wonder_mosey_wild.ko` | vendor | `/vendor/lib/modules/wonder_mosey_wild.ko` | Virtual wonder phy kernel module | Built by `build.sh` |
-| `rename_phy` | vendor | `/vendor/bin/rename_phy` | NL80211 phy rename utility (static aarch64) | Built by `build.sh` |
-| `mosey_server.pid` | data | `/data/adb/mosey-extended/mosey_server.pid` | Runtime PID file | service.sh |
-| `service.log` | data | `/data/adb/mosey-extended/service.log` | Module boot log | service.sh |
-| `mosey_server.log` | data | `/data/adb/mosey-extended/mosey_server.log` | mosey_server stdout/stderr | service.sh |
-
-### Module file tree (KSU/Magisk overlay)
-
-```
-module root/
-├── module.prop
-├── service.sh                    ← boot-time launcher
-├── sepolicy.rule                 ← runtime SELinux rules
-├── customize.sh                  ← install-time setup
-├── uninstall.sh
-├── payload/
-│   └── pixel_experience_*.xml    ← GMS feature flags by year
-├── system/
-│   └── vendor/
-│       ├── bin/
-│       │   ├── mosey_server      ← from Pixel 10 vendor image
-│       │   └── rename_phy        ← built by build.sh
-│       ├── etc/
-│       │   └── init/
-│       │       └── mosey.rc
-│       └── lib/
-│           └── modules/
-│               └── wonder_mosey_wild.ko   ← built by build.sh
-└── agy/
-    ├── ksu_wonder_module/
-    │   └── mosey_wonder/
-    │       ├── wonder_mosey_wild.c    ← kernel module source
-    │       ├── Dockerfile.kmod        ← build environment
-    │       ├── build.sh               ← one-command builder
-    │       ├── Kbuild
-    │       └── rename_phy.c
-    └── native_poc/
-        └── native_poc_docs.md         ← BCM wondertap research
-```
-
----
-
-## 6. Current status
-
-| Component | Status | Notes |
-|-----------|--------|-------|
-| mosey_server binary (Pixel 10) | ✅ Extracted | In `system/vendor/bin/mosey_server` |
-| mosey.rc init definition | ✅ Working | `system/vendor/etc/init/mosey.rc` |
-| SELinux policy (KSU sepolicy.rule) | ✅ Working | Minimal allow rules; full CIL files still needed for production |
-| Pixel Experience feature flags | ✅ Working | `payload/pixel_experience_*.xml` injected |
-| `wonder_mosey_wild.ko` (virtual phy) | ⚠️ Building | Build6 in progress; target vermagic: `6.1.145-android14-11-Wild-Exclusive` |
-| service.sh boot launcher | ✅ Working | Waits for `sys.boot_completed`, starts mosey_server |
-| phy rename (`iw phy phyN set name wonder`) | ⚠️ Pending ko | Waits for `wonder_mosey_wild.ko` to expose `phy_index` |
-| Native BCM wondertap (Pixel 7/8) | ❌ Blocked | No wonder.ko for kernel 5.10/5.15; standalone module is the workaround |
-| Full 802.11 frame I/O | ❌ Not yet | Requires real BCM4398 hardware path (Pixel 9+ only) |
-| Non-Pixel devices | 🔬 Research | Theoretically works with KSU + virtual phy; untested |
-
-**Active development target**: Pixel 8 Pro (husky) running Wild KSU
-(`6.1.145-android14-11-Wild-Exclusive`).
-
----
-
-## 7. Build: wonder\_mosey\_wild.ko
-
-The kernel module is built inside Docker against the exact kernel source
-that Wild KSU uses, so the vermagic matches byte-for-byte.
-
-### Prerequisites
-
-- Docker Desktop (macOS / Linux)
-- 20 GB free disk space (Docker image is ~8 GB; first build ~15–25 min)
-
-### Build
-
-```bash
-cd agy/ksu_wonder_module/mosey_wonder
-bash build.sh
-# Output: <repo-root>/out/wonder_mosey_wild.ko
-# Expected: [+] vermagic: 6.1.145-android14-11-Wild-Exclusive SMP preempt mod_unload modversions aarch64
-```
-
-Subsequent builds use the Docker layer cache and take ~30 seconds.
-
-### Kernel environment (Dockerfile.kmod)
-
-| Item | Value |
-|------|-------|
-| Base image | `ubuntu:noble` |
-| Compiler | `clang-17` / `LLVM=1` (required for `CONFIG_KCFI_CLANG=y`) |
-| Kernel manifest | `android.googlesource.com/kernel/manifest` branch `common-android14-6.1-2025-09` |
-| Wild KSU patch | `WildKernels/kernel_patches` — `ksun-5a4a718-susfs-f7ae19ef-gki-android14-6.1.patch` |
-| EXTRAVERSION | `-android14-11` (injected via `sed` into kernel `Makefile`) |
-| CONFIG\_LOCALVERSION | `-Wild-Exclusive` (set via hardcoded `setlocalversion` script) |
-| Target vermagic | `6.1.145-android14-11-Wild-Exclusive SMP preempt mod_unload modversions aarch64` |
-
-### Building for other kernel versions
-
-| Target device | Kernel | Manifest branch | Change in Dockerfile |
-|---------------|--------|-----------------|----------------------|
-| Pixel 8 / 8 Pro (stock) | 5.15 | `android14-5.15` | Update branch + EXTRAVERSION |
-| Pixel 7 / 7 Pro | 5.10 | `android13-5.10` | Update branch + EXTRAVERSION |
-| Pixel 9 / 10 | 6.1 | `android14-6.1-2025-09` | Same as Wild KSU (no patch needed) |
-| Samsung S24 | 6.1 | Check Samsung kernel source | Different EXTRAVERSION / CONFIG\_LOCALVERSION |
-
----
-
-## 8. Deployment & service.sh integration
-
-### Push and load manually
-
-```bash
-adb push out/wonder_mosey_wild.ko /data/local/tmp/
-adb shell su -c 'insmod /data/local/tmp/wonder_mosey_wild.ko'
-
-# Verify:
-adb shell dmesg | grep wonder_mosey_wild
-# Expected: wonder_mosey_wild: phy2  MAC=6a:b0:5d:c7:27:3d  →  iw phy phy2 set name wonder
-
-# Rename phy:
-WPHY=$(adb shell su -c 'cat /sys/module/wonder_mosey_wild/parameters/phy_index')
-adb shell su -c "iw phy phy${WPHY} set name wonder"
-```
-
-### service.sh integration snippet
-
-Add this block **before** the mosey_server launch in `service.sh`:
-
-```sh
-WONDER_KO="$MODDIR/system/vendor/lib/modules/wonder_mosey_wild.ko"
-if [ -f "$WONDER_KO" ]; then
-    insmod "$WONDER_KO"
-    /system/bin/sleep 1
-    WPHY=$(cat /sys/module/wonder_mosey_wild/parameters/phy_index 2>/dev/null)
-    if [ -n "$WPHY" ] && [ "$WPHY" -ge 0 ] 2>/dev/null; then
-        iw phy phy${WPHY} set name wonder
-    fi
-fi
-```
-
-> **Wild KSU warning**: Wild KSU's `service.sh` executor strips standalone
-> `#` comment lines before running the script. Do not add comment-only lines.
-
-### Module parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `mac_addr` | `6a:b0:5d:c7:27:3d` | MAC address returned for NL80211 vendor subcmd 5. Must be locally-administered (U/L bit set). |
-| `phy_index` | read-only | phy index assigned by cfg80211. Read via `/sys/module/wonder_mosey_wild/parameters/phy_index` to call `iw phy phyN set name wonder`. |
-
-Example with custom MAC:
-
-```bash
-insmod wonder_mosey_wild.ko mac_addr=02:ab:cd:ef:12:34
-```
-
----
-
-## 9. Known limitations
-
-1. **No real 802.11 RF on Pixel 7/8**: `wonder_mosey_wild.ko` creates a virtual
-   phy. The `wonder0` interface exists and mosey_server's init sequence
-   completes, but no actual 802.11 frames are transmitted or received. Proximity
-   discovery via 802.11 scanning will not work. BLE-based discovery is unaffected.
-
-2. **SELinux partial coverage**: `sepolicy.rule` provides the minimal rules for
-   mosey_server to start. The full vendor CIL policy from Pixel 10 is not yet
-   integrated. Some binder calls or capabilities may fail silently in enforcing
-   mode.
-
-3. **mosey_server binary source**: The binary must be sourced independently from
-   a Pixel 10 vendor factory image. It is not redistributed in this module.
-
-4. **BCM4389 wondertap**: No wonder.ko for kernel 5.10 or 5.15 exists in any
-   public repo. This is the fundamental blocker for a native BCM4389 approach.
-   The standalone `wonder_mosey_wild.ko` is the only viable workaround.
-
-5. **Play Integrity**: Do not spoof `Build.DEVICE` or `Build.MODEL` to `blazer`
-   (Pixel 10). TrickyStore + PlayIntegrityFork must remain intact.
-
-6. **Non-Pixel devices**: Theoretically applicable to any Android phone with
-   KSU/Magisk. The mosey_server binary and SELinux policy are Pixel-native;
-   behavior on other OEM devices is untested and may require additional
-   vendor policy adaptation.
-
----
----
-
-<a id="русский"></a>
-
-# Русский
-
+# Mosey Extended — Pixel 8 Pro / husky Research
 
 > [!WARNING]
-> **ЭКСПЕРИМЕНТАЛЬНО! ПРОЕКТ В АКТИВНОЙ РАЗРАБОТКЕ!**
-> 
-> **ПРОШИВАЙТЕ ЛЮБЫЕ МОДУЛИ НА СВОЙ СТРАХ И РИСК!** Вы **ДОЛЖНЫ** понимать **все**, что делаете.  
-> Файлы предоставлены только в целях исслелдования и дебага. 
+> This is an experimental research project for a single, explicitly defined test platform:
+> **Google Pixel 8 Pro (husky), Android 16, Build CP1A.260505.005.A1**.
+>
+> The project is not a claim of compatibility with Pixel 7/8/8a, Pixel 9/10, Samsung, BBK,
+> or other devices. Results from other devices must be treated as separate research unless
+> independently verified.
+>
+> This project is independent and is not affiliated with, authorized by, or endorsed by
+> Google LLC or Apple Inc. AirDrop, Android, Google, Quick Share and related names are
+> trademarks of their respective owners.
 
-## Оглавление
+## Project goal
 
-1. [Что это такое?](#1-что-это-такое)
-2. [Как работает AirDrop (mosey) — полный стек](#2-как-работает-airdrop-mosey--полный-стек)
-3. [Полное дерево модификаций](#3-полное-дерево-модификаций)
-4. [Поддерживаемые устройства и Wi-Fi модемы](#4-поддерживаемые-устройства-и-wi-fi-модемы)
-5. [Таблица расположения ключевых файлов](#5-таблица-расположения-ключевых-файлов)
-6. [Текущий статус](#6-текущий-статус)
-7. [Сборка: wonder\_mosey\_wild.ko](#7-сборка-wonder_mosey_wildko)
-8. [Развёртывание и интеграция с service.sh](#8-развёртывание-и-интеграция-с-servicesh)
-9. [Известные ограничения](#9-известные-ограничения)
+The objective is **real, bidirectional AirDrop file transfer between this Pixel 8 Pro and an iPhone**.
 
----
+A successful result must include all of the following:
 
-## 1. Что это такое?
+1. Pixel discovers iPhone / Apple devices.
+2. iPhone discovers Pixel.
+3. Required authentication / channel establishment succeeds.
+4. A real data communication path is established.
+5. Pixel → iPhone file transfer succeeds.
+6. iPhone → Pixel file transfer succeeds.
+7. The final behavior should approach the native Quick Share ↔ AirDrop experience as closely as practical.
 
-Ранее я провёл реверс-инженеринг прошивки Pixel 10 и обнаружил
-недостающий компонент, необходимый для включения AirDrop-функциональности в
-Google Quick Share на старых устройствах Pixel — и потенциально на любом Android
-вообще. Речь идёт не просто об идентификационных файлах.
+The following are **not** considered success by themselves:
 
-Был найден нативный бинарник **`mosey_server`** (название совпадает с APK-
-расширением Quick Share). Статический анализ показывает, что это нативный
-Android-сервис, а не CLI-утилита. Он линкуется с `libbinder_ndk.so`,
-`liblog.so`, `libc.so`, `libdl.so` и содержит строку
-`AServiceManager_addService`. Встроенный путь к исходникам
-`vendor/google/services/QuickShareExtension/src/server.rs` подтверждает, что
-бинарник является частью расширения Quick Share и должен запускаться при
-загрузке системы.
-
-Бинарник пытается зарегистрировать нативный AIDL (NDK Binder) сервис через
-`AServiceManager_addService("com.google.pixel.service.IService/default")`.
-
-Начальные попытки внедрить и запустить бинарник через KSU-модуль провалились,
-потому что:
-1. `AServiceManager_addService()` проверяет больше, чем просто SELinux allow-правила.
-2. Имя сервиса обязательно должно быть сопоставлено с SELinux-типом в `vendor_service_contexts`.
-3. Без этого сопоставления регистрация завершается ошибкой `PERMISSION_DENIED` или `UNKNOWN_ERROR`.
-
-В vendor-образе Pixel 10 уже присутствуют все необходимые компоненты. Этот
-проект переносит их — вместе с виртуальным Wi-Fi-интерфейсом «wonder» — на
-любое устройство с root-доступом.
+- Quick Share UI changes
+- AirDrop / Quick Share icons appearing
+- a feature flag being enabled
+- BLE discovery alone
+- creation of `wonder0`
+- creation of a virtual PHY
+- successful startup of `MoseyApp` or `mosey_server`
+- successful registration of a vendor command
+- existence of `radiotap0`
 
 ---
 
-## 2. Как работает AirDrop (mosey) — полный стек
+## 1. Fixed research platform
 
-«AirDrop» Google (внутреннее кодовое название **mosey**) в Quick Share требует
-наличия специального Wi-Fi-интерфейса с именем `wonder`. Сервис `mosey_server`
-взаимодействует с этим интерфейсом через подсистему `cfg80211`/`nl80211`.
+All conclusions in this repository are scoped to this exact platform unless explicitly stated otherwise.
 
-Полная последовательность загрузки:
+| Item | Current value |
+|---|---|
+| Device | Google Pixel 8 Pro |
+| Codename | `husky` |
+| SoC | Tensor G3 |
+| Android | Android 16 |
+| Build | `CP1A.260505.005.A1` |
+| SDK | `36` |
+| Kernel | `6.1.145-android14-11-gfa1d6308d1fe-ab14691759` |
+| Kernel toolchain | clang 17.0.2 / aarch64 |
+| Kernel | Android GKI, SMP PREEMPT |
+| SELinux | Enforcing |
+| Boot slot | `_b` |
+| Verified Boot | green |
+| Root | KernelSU Next |
+| WLAN driver | `bcmdhd4398` |
 
+### Important correction: Wi-Fi chipset
+
+Earlier project material incorrectly classified Pixel 8 / 8 Pro as BCM4389.
+
+That classification is **not used by this project anymore**.
+
+For the current target device, the hardware basis is:
+
+```text
+Pixel 8 Pro (husky)
+    ↓
+bcmdhd4398
+    ↓
+BCM4398
 ```
-Загрузка
- └─ init разбирает mosey.rc
-     └─ запускает mosey_server (права NET_ADMIN, NET_RAW)
-         ├─ регистрирует "com.google.pixel.service.IService/default" в servicemanager
-         ├─ создаёт "wonder0" (MONITOR-режим) через NL80211_CMD_NEW_INTERFACE
-         ├─ устанавливает канал 149 / 5745 МГц через NL80211_CMD_SET_CHANNEL
-         ├─ отправляет NL80211 vendor-команды (vendor_id=0x1A11):
-         │   ├─ subcmd 1: set_frequency
-         │   ├─ subcmd 2: set_filter
-         │   ├─ subcmd 3: set_fixed_tx_rate
-         │   ├─ subcmd 4: set_reg
-         │   └─ subcmd 5: get_if_mac_addr → читает 6-байтовый MAC
-         └─ открывает PF_PACKET / TPACKET_V3 на wonder0 для I/O 802.11-фреймов
-```
 
-На Pixel 9 / 10 эта цепочка работает нативно через механизм `wondertap` чипа
-BCM4398 внутри `bcmdhd`. На старых Pixel (7/8) и не-Pixel устройствах этот
-проект предоставляет недостающие части:
-
-- **`wonder_mosey_wild.ko`** — автономный виртуальный mac80211-драйвер, создающий
-  phy `wonder` и нативно обрабатывающий все vendor-команды.
-- **SELinux-политика** — извлечена из Pixel 10, внедряется через `sepolicy.rule` KSU.
-- **`mosey.rc`** — определение init-сервиса, накладывается через KSU-модуль.
+This is an **[EMPIRICAL / DEVICE-VERIFIED]** project fact and takes precedence over older README or PR descriptions.
 
 ---
 
-## 3. Полное дерево модификаций
+## 2. Evidence policy
 
-Ниже перечислены все слои, которые необходимо изменить или предоставить для
-включения AirDrop — от высокоуровневых feature-флагов до драйвера модема.
-✅ — реализовано в модуле; ⚠️ — частично/в процессе; ❌ — не реализовано.
+Every technical statement in this repository should be classified into one of four evidence levels.
 
+### [EMPIRICAL]
+Verified directly on the target Pixel 8 Pro.
+
+Examples:
+
+- running kernel version
+- loaded `bcmdhd4398`
+- existence and properties of `radiotap0`
+- existence of `aware_nmi0`
+- extracted module hashes / Build IDs
+- actual process and logcat observations
+
+### [SOURCE-CONFIRMED]
+Supported by Google / Android / Broadcom source code or by direct source inspection of the project.
+
+Examples:
+
+- Google Wonder exists as a real kernel component
+- BCM4398 DHD source contains monitor/radiotap support
+- BCM4398 DHD source contains Action Frame TX/RX paths
+- `aware_nmi0` is part of the NAN/NMI implementation
+- Google Wonder uses a vendor-driver integration layer / WonderTap architecture
+
+### [AUTHOR-CLAIM]
+A claim made by a project author, issue, PR or README that has not been independently verified on this Pixel 8 Pro.
+
+Examples:
+
+- PR #8's claim of theoretical support
+- claims that older Pixel devices can obtain usable AirDrop RF through `wonder_mosey_wild.ko`
+- generic multi-device compatibility claims
+
+### [INFERENCE]
+A technical hypothesis derived from evidence but not yet experimentally proven.
+
+Examples:
+
+- `radiotap0` is the DHD monitor/radiotap netdev created by the BCM4398 stack
+- `radiotap0` TX may ultimately reach BCM4398 firmware
+- a WonderTap adapter may be sufficient if the existing monitor/RF path is usable
+
+No inference should be promoted to a fact without a corresponding test or source proof.
+
+---
+
+## 3. Current kernel / WLAN facts
+
+The target kernel has already been checked and is known to provide:
+
+```text
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+CONFIG_MODULES=y
+CONFIG_MODVERSIONS=y
+CONFIG_WLAN=y
 ```
-AirDrop (mosey Quick Share) — полный стек
-│
-├── [Слой 0] Phenotype / Feature Flags                           ✅
-│   ├── pixel_experience_YYYY.xml
-│   │   └── com.google.android.feature.PIXEL_XXXX_EXPERIENCE
-│   │       объявляет устройство Pixel-классом для GMS
-│   ├── phenotype.db
-│   │   └── NearbyShare / QuickShare feature gates
-│   └── payload/pixel_experience_*.xml
-│       └── внедряется через overlay KSU-модуля (install.sh)
-│
-├── [Слой 1] APK / GMS                                           ✅ (управляется GMS)
-│   ├── com.google.android.gms — ядро Nearby/Quick Share
-│   ├── com.google.android.apps.nearby.sharewidget — UI Quick Share
-│   └── MoseyApp — vendor APK-расширение Quick Share
-│
-├── [Слой 2] Нативный бинарник                                   ✅
-│   └── /vendor/bin/mosey_server
-│       ├── Язык: Rust (встроенный путь к исходникам)
-│       ├── Зависимости: libbinder_ndk, liblog, libc, libdl
-│       └── Binder-сервис: "com.google.pixel.service.IService/default"
-│
-├── [Слой 3] Init / управление сервисами                         ✅
-│   └── /vendor/etc/init/mosey.rc
-│       ├── on boot: start mosey_server
-│       ├── user system, group system inet
-│       └── capabilities: NET_ADMIN NET_RAW
-│
-├── [Слой 4] SELinux-политика                                    ✅ (частично)
-│   ├── vendor_service_contexts
-│   │   └── "com.google.pixel.service.IService/default" → mosey_service
-│   ├── vendor_sepolicy.cil
-│   │   └── allow-правила для домена mosey_server
-│   ├── vendor_file_contexts
-│   │   └── /vendor/bin/mosey_server → u:object_r:mosey_exec:s0
-│   ├── product_sepolicy.cil
-│   │   └── домен mosey_app, правила typeattributeset
-│   ├── system_ext_sepolicy.cil
-│   │   └── правила mosey для раздела system_ext
-│   ├── system_ext_seapp_contexts
-│   │   └── пакет приложения → SELinux-домен
-│   └── 202504.cil
-│       └── маппинг совместимости API 36 / Android 16
-│
-├── [Слой 5] Wi-Fi интерфейс (phy «wonder»)                     ⚠️ (сборка в процессе)
-│   ├── cfg80211 phy с именем "wonder"
-│   │   └── переименование: iw phy phyN set name wonder
-│   ├── wonder0 — MONITOR-режим (NL80211_CMD_NEW_INTERFACE)
-│   ├── канал: 149 / 5745 МГц (диапазон 5 ГГц)
-│   └── NL80211 vendor-команды (vendor_id = 0x001A11):
-│       ├── subcmd 1: set_frequency  → noop (return 0)
-│       ├── subcmd 2: set_filter     → noop (return 0)
-│       ├── subcmd 3: set_fixed_tx_rate → noop (return 0)
-│       ├── subcmd 4: set_reg        → noop (return 0)
-│       └── subcmd 5: get_if_mac_addr → возвращает 6-байтовый MAC
-│
-├── [Слой 6] Kernel-модуль                                       ⚠️ (сборка в процессе)
-│   │
-│   ├── Вариант A — нативный (Samsung wonder.ko) [только Pixel 9+, S24 Exynos]
-│   │   ├── BCM wondertap интерфейс к драйверу bcmdhd
-│   │   ├── Требует: DT-phandle "wondertap-provider" в device tree
-│   │   ├── Требует: чип BCM4398 + bcmdhd с символами wondertap
-│   │   └── Готовые бинарники: kernel 6.1.145 (Pixel 9), 6.1.157 (S24 Exynos)
-│   │
-│   └── Вариант B — автономный (wonder_mosey_wild.ko) ← ЭТОТ ПРОЕКТ
-│       ├── Виртуальный mac80211-драйвер, не требует железа
-│       ├── Нативно удовлетворяет полную NL80211 init-последовательность
-│       ├── Ядро: android14-6.1-2025-09 + патчи Wild KSU
-│       ├── vermagic: 6.1.145-android14-11-Wild-Exclusive
-│       └── Работает на любом устройстве с KSU/Magisk (виртуальный phy, без RF)
-│
-└── [Слой 7] Wi-Fi драйвер / прошивка модема                    зависит от устройства
-    ├── BCM4398 (Pixel 9/10, Samsung Galaxy S24 Exynos)
-    │   ├── bcmdhd4390.ko с нативным wondertap
-    │   └── Полный RF: реальная передача/приём 802.11-фреймов через wonder0
-    ├── BCM4389 (Pixel 7/8, Pixel Fold)
-    │   ├── bcmdhd без нативного wondertap
-    │   └── wonder_mosey_wild.ko предоставляет виртуальный phy (без RF)
-    ├── Qualcomm FastConnect (Samsung S24/S25 Snapdragon, OnePlus и др.)
-    │   └── Нет wondertap; только виртуальный phy через этот модуль
-    └── MediaTek MT7925 (OPPO Find X8, Vivo X200, Xiaomi 15)
-        └── Нет wondertap; только виртуальный phy через этот модуль
+
+The running system has:
+
+```text
+mac80211
+cfg80211
+bcmdhd4398
+```
+
+Therefore this project is **not** starting from a kernel that lacks mac80211/cfg80211.
+
+The active WLAN stack is at least:
+
+```text
+Pixel 8 Pro
+    ↓
+BCM4398
+    ↓
+bcmdhd4398
+    ↓
+mac80211 / cfg80211
 ```
 
 ---
 
-## 4. Поддерживаемые устройства и Wi-Fi модемы
+## 4. Important discovered interfaces
 
-> **Пояснение к столбцам**
-> - **Нативный wonder** — устройство поставляется с BCM wondertap в bcmdhd + wonder.ko
-> - **Виртуальный phy** — `wonder_mosey_wild.ko` может предоставить wonder-интерфейс (без реального RF)
-> - **mosey_server** — бинарник из vendor-образа Pixel 10; нужен SELinux-перенос на всех не-Pixel-10 устройствах
+### `radiotap0`
 
-### Google Pixel
+The target device exposes:
 
-| Устройство | Кодовое имя | SoC | Wi-Fi чип | Нативный wonder | Виртуальный phy | Примечания |
-|------------|-------------|-----|-----------|:---:|:---:|------------|
-| Pixel 10 Pro XL | mustang | Tensor G5 | BCM4398 |  ✅ | ✅ | Официально поддерживается |
-| Pixel 10 Pro | blazer | Tensor G5 | BCM4398 | ✅ | ✅ | Официально поддерживается |
-| Pixel 10 | frankel | Tensor G5 | BCM4398 |  ✅ | ✅ | Официально поддерживается |
-| Pixel 9 Pro XL | komodo | Tensor G4 | BCM4390 |  ✅ | ✅ | Официально поддерживается, bcmdhd4390.ko с wondertap |
-| Pixel 9 Pro | caiman | Tensor G4 | BCM4390 |  ✅ | ✅ | Официально поддерживается, bcmdhd4390.ko с wondertap |
-| Pixel 9 Pro Fold | comet | Tensor G4 | BCM4390 |  ✅ | ✅ | Официально поддерживается, bcmdhd4390.ko с wondertap |
-| Pixel 9 | tokay | Tensor G4 | BCM4390 | ✅ | ✅ | Официально поддерживается |
-| Pixel 9a | tegu | Tensor G4 | BCM4389 | ❌ | ? | – |
-| Pixel 8 Pro | husky | Tensor G3 | BCM4389 |  ❌ | ✅ | Основная цель этого проекта |
-| Pixel 8 | shiba | Tensor G3 | BCM4389 | ❌ | ✅ | – |
-| Pixel 8a | akita | Tensor G3 | BCM4383 | ❌ | ✅ | – |
-| Pixel 7 Pro | cheetah | Tensor G2 | BCM4389 | ❌ | ✅ | – |
-| Pixel 7 | panther | Tensor G2 | BCM4389 | ❌ | ✅ | – |
-| Pixel 7a | lynx | Tensor G2 | BCM4389 | ❌ | ✅ | – |
-| Pixel Fold | felix | Tensor G2 | BCM4389 | ❌ | ✅ | – |
+```text
+radiotap0
+```
 
-### Samsung Galaxy S
+Observed properties:
 
-| Устройство  | SoC | Wi-Fi чип | Нативный wonder | Виртуальный phy | Примечания |
-|------------|-----|-----------|:---:|:---:|------------|
-| Galaxy S24 |  Exynos 2400 | BCM4398 | ✅ | ✅ | wonder.ko kernel 6.1.157 подтверждён |
-| Galaxy S24+| Exynos 2400 | BCM4398 |  ✅ | ✅ | Аналогично S24 Exynos |
-| Galaxy S24 |  Snapdragon 8 Gen 3 | Qualcomm WCN685x |  ✅ | ✅ | – |
-| Galaxy S24+ | Snapdragon 8 Gen 3 | Qualcomm WCN685x | | ✅ | ✅ | — |
-| Galaxy S24 Ultra |  Snapdragon 8 Gen 3 | Qualcomm WCN685x |  ✅ | ✅ | – |
-| Galaxy S25 |  Snapdragon 8 Elite | Qualcomm FastConnect 7900 | ✅ | ✅ | – |
-| Galaxy S25+ |  Snapdragon 8 Elite | Qualcomm FastConnect 7900 | ✅ | ✅ | — |
-| Galaxy S25 Ultra | Snapdragon 8 Elite | Qualcomm FastConnect 7900 |  ✅ | ✅ | — |
+```text
+ifindex      49
+type         803 (ARPHRD_IEEE80211_RADIOTAP)
+iflink       49
+state        DOWN
+operstate    down
+address      00:00:00:00:00:00
+rx_packets   0
+tx_packets   0
+```
 
-### BBK
+The sysfs path is:
 
-| Устройство | SoC | Wi-Fi чип |  Нативный wonder | Виртуальный phy | Примечания |
-|------------|-----|-----------|:---:|:---:|------------|
-| Vivo X300 Pro | Dimensity 9500 | MediaTek MT6993 | ✅ | ✅ | — |
-| OPPO Find X8 Pro | Dimensity 9400 | MediaTek MT7925 | ✅ | ✅ | — |
-| OPPO Find X8 Ultra | Dimensity 9400 | MediaTek MT7925 | ✅ | ✅ | — |
+```text
+/sys/devices/virtual/net/radiotap0
+```
 
-> **Примечание о виртуальном phy**: `wonder_mosey_wild.ko` создаёт корректный интерфейс `wonder0`
-> и удовлетворяет полную NL80211 init-последовательность `mosey_server`. Однако без нативного
-> BCM wondertap реальный I/O 802.11-фреймов не работает — обнаружение устройств через 802.11
-> недоступно. BLE-обнаружение при этом не затрагивается. Это текущее ограничение для всех
-> не-BCM устройств.
+There is no `wireless/` directory and no `phy80211` entry.
+
+**[EMPIRICAL]** `radiotap0` is therefore a virtual Linux netdev with IEEE 802.11 radiotap type 803.
+
+**[SOURCE-CONFIRMED]** BCM DHD monitor implementations use a virtual radiotap netdev and contain monitor TX/RX handling.
+
+**[INFERENCE]** The current `radiotap0` is very likely associated with the BCM4398 DHD monitor subsystem.
+
+What is **not yet proven**:
+
+```text
+radiotap0 TX
+    ↓
+bcmdhd4398
+    ↓
+BCM4398 firmware
+    ↓
+RF
+```
+
+This exact path is one of the primary remaining research targets.
+
+### `aware_nmi0`
+
+Observed:
+
+```text
+ifindex      46
+type         1
+state        DOWN
+address      00:90:4c:33:22:11
+```
+
+**[SOURCE-CONFIRMED]** Google/Broadcom BCM DHD NAN source defines `aware_nmi0` as the NMI interface used by the NAN implementation.
+
+The NAN NMI transmit callback is not a normal data-plane TX path; the source explicitly treats the interface as an auxiliary/control mechanism.
+
+Therefore:
+
+```text
+aware_nmi0 ≠ generic raw 802.11 data TX interface
+```
+
+It remains relevant to NAN / discovery research, but it should not be treated as the final AirDrop RF transport.
 
 ---
 
-## 5. Таблица расположения ключевых файлов
+## 5. BCM4398 driver binary investigation
 
-Файлы, относящиеся к mosey — берутся из vendor-образа Pixel 10, если не указано иное.
-Все пути указаны на стороне устройства (после overlay).
+Two stock modules exist on the target device:
 
-| Файл | Раздел | Путь на устройстве | Назначение | Источник |
-|------|--------|--------------------|------------|----------|
-| `mosey_server` | vendor | `/vendor/bin/mosey_server` | Нативный бинарник AirDrop-сервиса (Rust) | Factory image Pixel 10 |
-| `mosey.rc` | vendor | `/vendor/etc/init/mosey.rc` | Определение init-сервиса | Pixel 10 / этот модуль |
-| `vendor_service_contexts` | vendor | `/vendor/etc/selinux/vendor_service_contexts` | Маппинг Binder-сервиса → SELinux-тип | Vendor image Pixel 10 |
-| `vendor_sepolicy.cil` | vendor | `/vendor/etc/selinux/vendor_sepolicy.cil` | Allow-правила для mosey_server | Vendor image Pixel 10 |
-| `vendor_file_contexts` | vendor | `/vendor/etc/selinux/vendor_file_contexts` | SELinux-метка `/vendor/bin/mosey_server` | Vendor image Pixel 10 |
-| `product_sepolicy.cil` | product | `/product/etc/selinux/product_sepolicy.cil` | Правила домена mosey_app | Product image Pixel 10 |
-| `system_ext_sepolicy.cil` | system_ext | `/system_ext/etc/selinux/system_ext_sepolicy.cil` | Правила mosey для system_ext | system_ext Pixel 10 |
-| `system_ext_seapp_contexts` | system_ext | `/system_ext/etc/selinux/system_ext_seapp_contexts` | Маппинг пакет → SELinux-домен | system_ext Pixel 10 |
-| `202504.cil` | system | `/system/etc/selinux/mapping/202504.cil` | Маппинг совместимости API 36 / Android 16 | System image Pixel 10 |
-| `compatibility_matrix.xml` | system | `/system/compatibility_matrix.device.xml` | Требования HAL + ядро | System image Pixel 10 |
-| `pixel_experience_YYYY.xml` | system | `/system/etc/permissions/pixel_experience_YYYY.xml` | GMS feature-декларации | Этот модуль (`payload/`) |
-| `sepolicy.rule` | модуль | `$MODDIR/sepolicy.rule` | Дополнительные SELinux-правила KSU | Этот модуль |
-| `wonder_mosey_wild.ko` | vendor | `/vendor/lib/modules/wonder_mosey_wild.ko` | Виртуальный kernel-модуль wonder phy | Собирается через `build.sh` |
-| `rename_phy` | vendor | `/vendor/bin/rename_phy` | NL80211 утилита переименования phy (статическая aarch64) | Собирается через `build.sh` |
-| `mosey_server.pid` | data | `/data/adb/mosey-extended/mosey_server.pid` | PID-файл времени выполнения | service.sh |
-| `service.log` | data | `/data/adb/mosey-extended/service.log` | Лог загрузки модуля | service.sh |
-| `mosey_server.log` | data | `/data/adb/mosey-extended/mosey_server.log` | stdout/stderr mosey_server | service.sh |
-
-### Дерево файлов модуля (overlay KSU/Magisk)
-
+```text
+/vendor_dlkm/lib/modules/bcmdhd4398.ko
+/vendor_dlkm/lib/modules/16k-mode/bcmdhd4398.ko
 ```
-корень модуля/
-├── module.prop
-├── service.sh                    ← загрузчик при загрузке системы
-├── sepolicy.rule                 ← runtime SELinux-правила
-├── customize.sh                  ← настройка при установке
-├── uninstall.sh
-├── payload/
-│   └── pixel_experience_*.xml    ← GMS feature-флаги по годам
-├── system/
-│   └── vendor/
-│       ├── bin/
-│       │   ├── mosey_server      ← из vendor-образа Pixel 10
-│       │   └── rename_phy        ← собирается через build.sh
-│       ├── etc/
-│       │   └── init/
-│       │       └── mosey.rc
-│       └── lib/
-│           └── modules/
-│               └── wonder_mosey_wild.ko   ← собирается через build.sh
-└── agy/
-    ├── ksu_wonder_module/
-    │   └── mosey_wonder/
-    │       ├── wonder_mosey_wild.c    ← исходник kernel-модуля
-    │       ├── Dockerfile.kmod        ← сборочное окружение
-    │       ├── build.sh               ← одной командой
-    │       ├── Kbuild
-    │       └── rename_phy.c
-    └── native_poc/
-        └── native_poc_docs.md         ← исследование BCM wondertap
+
+They are **not identical binaries**.
+
+### Standard module
+
+```text
+SHA-256:
+e2c3656e56bf94763e00a51182c16ca0db472282206323410177075a4c8751dd
+
+Size:
+9,921,072 bytes
+
+Build ID:
+de704232a38f39a56f6501d0d9fce3e3f15abf92
+```
+
+### 16K module
+
+```text
+SHA-256:
+59a6588bf23855f7903d715d5071967f48b516cb65ecc4f3ed80b7c9c4ada8d4
+
+Size:
+9,929,264 bytes
+
+Build ID:
+05757726fed97d4195a55874b5348095a6ab635c
+```
+
+Both are reported by `file` as:
+
+```text
+ELF 64-bit LSB relocatable, ARM aarch64, not stripped
+```
+
+The running kernel exposes the loaded module as:
+
+```text
+/sys/module/bcmdhd4398
+```
+
+and reports:
+
+```text
+scmversion = g64bfcee46f4f
+coresize   = 3870720
+initstate  = live
+```
+
+The module file `vermagic` previously observed is:
+
+```text
+6.1.145-android14-11-g164ae0b804dd-ab15037554
+```
+
+> Do not use the abbreviated line above for ABI decisions. The exact module metadata and running-kernel relationship still require dedicated investigation.
+
+### Why the `.ko` is especially valuable
+
+The extracted module is **not stripped** and contains `.symtab` / `.strtab` in the extracted ELF. This makes function-level static analysis practical.
+
+The next analysis target is **not a newly compiled module**.
+
+It is the stock binary:
+
+```text
+bcmdhd4398.ko
+```
+
+For the first pass, use the standard 4K-tree copy:
+
+```text
+/Users/patrick/Downloads/bcmdhd4398.ko
+```
+
+The separate 16K variant should only be analyzed afterward if the first binary does not explain the running path.
+
+---
+
+## 6. What the stock BCM4398 binary already proves
+
+The extracted `bcmdhd4398.ko` contains visible symbols / strings associated with all of the following:
+
+### Monitor / radiotap
+
+```text
+dhd_add_monitor_if
+dhd_del_monitor_if
+dhd_monitor_open
+dhd_monitor_stop
+dhd_monitor_ioctl
+dhd_set_monitor_ioctl
+dhd_monitor_enabled
+wl_cfg80211_add_monitor_if
+wl_cfg80211_set_monitor_channel
+radiotap
+DHD-MON
+```
+
+### Action Frame TX/RX
+
+```text
+wl_cfg80211_send_action_frame
+wl_cfgp2p_tx_action_frame
+wl_cfg80211_abort_action_frame
+wl_cfg80211_actframe_fillup_v2
+wl_cfgp2p_action_tx_complete
+wl_notify_rx_mgmt_frame
+WLC_E_ACTION_FRAME_RX
+WLC_E_ACTION_FRAME_COMPLETE
+```
+
+### Data TX/RX
+
+```text
+dhd_prot_txdata
+dhd_bus_txdata
+dhd_rx_frame
+dhd_bus_rx_frame
+```
+
+### NAN
+
+The binary contains extensive NAN implementation symbols and event strings, including:
+
+```text
+wl_cfgnan_init
+wl_cfgnan_attach
+wl_cfgnan_start_handler
+wl_cfgnan_transmit_handler
+wl_cfgvendor_nan_transmit
+wl_cfgvendor_nan_data_path_iface_create
+wl_cfgvendor_nan_data_path_iface_delete
+wl_cfgnan_get_capablities
+...
+```
+
+and explicit references to `aware_nmi0`.
+
+### Important conclusion
+
+**[SOURCE-CONFIRMED / BINARY-CONFIRMED]** The stock BCM4398 driver contains substantially more functionality than a basic Android Wi-Fi data driver. It has monitor/radiotap, Action Frame, NAN and low-level DHD TX/RX infrastructure.
+
+This does **not** yet prove that the driver can perform arbitrary raw 802.11 frame injection suitable for Wonder/AirDrop.
+
+---
+
+## 7. WonderTap / Google Wonder status
+
+Google Wonder is a real Google kernel component. It is not a concept invented by this project.
+
+The generic Wonder architecture contains a virtual mac80211/SoftMAC layer and a vendor-driver integration mechanism commonly referred to as **WonderTap**.
+
+The critical unresolved question for this device is:
+
+```text
+Does stock bcmdhd4398 provide a WonderTap-equivalent provider,
+OR can one be attached to its existing monitor/RF path without
+reimplementing the Wi-Fi radio?
+```
+
+### Current evidence
+
+**[SOURCE-CONFIRMED]** Google Wonder uses a vendor-driver integration layer.
+
+**[BINARY-CONFIRMED]** `bcmdhd4398.ko` has substantial monitor/radiotap and Action Frame infrastructure.
+
+**[BINARY NEGATIVE EVIDENCE]** Straight `strings` searches of the extracted module have not exposed an obvious `wondertap`, `wonder0`, or similar Wonder provider name.
+
+**[NOT PROVEN]** Absence from `strings` is not proof that no equivalent provider exists.
+
+Therefore the current state is:
+
+```text
+bcmdhd4398 → monitor/radiotap        CONFIRMED
+bcmdhd4398 → real Action Frame TX    CONFIRMED
+bcmdhd4398 → real Action Frame RX    CONFIRMED
+bcmdhd4398 → NAN/Aware               CONFIRMED
+bcmdhd4398 → WonderTap               UNKNOWN
+radiotap0 → firmware TX/RX            UNKNOWN
 ```
 
 ---
 
-## 6. Текущий статус
+## 8. Why `wonder_mosey_wild.ko` is not the current solution
 
-| Компонент | Статус | Примечания |
-|-----------|--------|------------|
-| Бинарник mosey_server (Pixel 10) | ✅ Извлечён | В `system/vendor/bin/mosey_server` |
-| Определение init mosey.rc | ✅ Работает | `system/vendor/etc/init/mosey.rc` |
-| SELinux-политика (sepolicy.rule KSU) | ✅ Работает | Минимальные allow-правила; полные CIL-файлы нужны для продакшена |
-| Feature-флаги Pixel Experience | ✅ Работают | `payload/pixel_experience_*.xml` внедряются |
-| `wonder_mosey_wild.ko` (виртуальный phy) | ⚠️ Сборка | Build6 в процессе; целевой vermagic: `6.1.145-android14-11-Wild-Exclusive` |
-| Загрузчик service.sh | ✅ Работает | Ждёт `sys.boot_completed`, запускает mosey_server |
-| Переименование phy | ⚠️ Ожидает .ko | Ждёт готовности `wonder_mosey_wild.ko` для чтения `phy_index` |
-| Нативный BCM wondertap (Pixel 7/8) | ❌ Заблокирован | Нет wonder.ko для ядра 5.10/5.15; автономный модуль — обходной путь |
-| Полный I/O 802.11-фреймов | ❌ Пока нет | Требует настоящего BCM4398 (только Pixel 9+) |
-| Не-Pixel устройства | 🔬 Исследование | Теоретически работает с KSU + виртуальный phy; не тестировалось |
+PR #8 (`BasGame1/mosey-p8a`) is open and unmerged. Its own description calls the device support theoretical / untested.
 
-**Активная цель разработки**: Pixel 8 Pro (husky) с Wild KSU
-(`6.1.145-android14-11-Wild-Exclusive`).
+The proposed `wonder_mosey_wild.ko` is a virtual mac80211 driver.
+
+Its current implementation:
+
+- registers a virtual `ieee80211_hw`
+- exposes monitor/station interface modes
+- registers vendor commands
+- has vendor command handlers that largely log and return success
+- frees transmitted sk_buffs in its TX callback
+- does not implement a real RF hardware TX/RX backend
+
+Therefore it must currently be classified as:
+
+```text
+virtual PHY / protocol-plumbing stub
+```
+
+and not as a complete AirDrop transport.
+
+**Do not treat `wonder_mosey_wild.ko` as the final answer for Pixel 8 Pro.**
 
 ---
 
-## 7. Сборка: wonder\_mosey\_wild.ko
+## 9. Current research architecture
 
-Kernel-модуль собирается внутри Docker на точном исходном коде ядра,
-который использует Wild KSU, — чтобы vermagic совпадал побайтово.
+The most useful current model is:
 
-### Требования
-
-- Docker Desktop (macOS / Linux)
-- 20 ГБ свободного места (образ Docker ~8 ГБ; первая сборка ~15–25 мин)
-
-### Сборка
-
-```bash
-cd agy/ksu_wonder_module/mosey_wonder
-bash build.sh
-# Результат: <корень репо>/out/wonder_mosey_wild.ko
-# Ожидаемое: [+] vermagic: 6.1.145-android14-11-Wild-Exclusive SMP preempt mod_unload modversions aarch64
+```text
+                           Quick Share / Mosey
+                                  │
+                             mosey_server
+                                  │
+                             Wonder protocol
+                                  │
+                         generic Wonder / SoftMAC
+                                  │
+                     ┌────────────┴────────────┐
+                     │                         │
+                WonderTap?               radiotap path?
+                     │                         │
+                     └────────────┬────────────┘
+                                  │
+                            bcmdhd4398
+                                  │
+                    ┌─────────────┼─────────────┐
+                    │             │             │
+                 wlan0         NAN/Aware      monitor
+                    │          aware_nmi0     radiotap0
+                    │             │             │
+                    └─────────────┴──────┬──────┘
+                                         │
+                                  BCM4398 firmware
+                                         │
+                                         RF
 ```
 
-Последующие сборки используют кэш слоёв Docker и занимают ~30 секунд.
-
-### Окружение сборки (Dockerfile.kmod)
-
-| Параметр | Значение |
-|----------|----------|
-| Базовый образ | `ubuntu:noble` |
-| Компилятор | `clang-17` / `LLVM=1` (требуется для `CONFIG_KCFI_CLANG=y`) |
-| Манифест ядра | `android.googlesource.com/kernel/manifest` ветка `common-android14-6.1-2025-09` |
-| Патч Wild KSU | `WildKernels/kernel_patches` — `ksun-5a4a718-susfs-f7ae19ef-gki-android14-6.1.patch` |
-| EXTRAVERSION | `-android14-11` (внедряется через `sed` в `Makefile` ядра) |
-| CONFIG\_LOCALVERSION | `-Wild-Exclusive` (задаётся hardcoded-скриптом `setlocalversion`) |
-| Целевой vermagic | `6.1.145-android14-11-Wild-Exclusive SMP preempt mod_unload modversions aarch64` |
-
-### Сборка для других версий ядра
-
-| Целевое устройство | Ядро | Ветка манифеста | Изменение в Dockerfile |
-|--------------------|------|-----------------|------------------------|
-| Pixel 8 / 8 Pro (сток) | 5.15 | `android14-5.15` | Обновить ветку + EXTRAVERSION |
-| Pixel 7 / 7 Pro | 5.10 | `android13-5.10` | Обновить ветку + EXTRAVERSION |
-| Pixel 9 / 10 | 6.1 | `android14-6.1-2025-09` | То же, что Wild KSU (патч не нужен) |
-| Samsung S24 | 6.1 | Исходники ядра Samsung | Другой EXTRAVERSION / CONFIG\_LOCALVERSION |
+The dashed/unknown portions are intentional: they are research targets, not established facts.
 
 ---
 
-## 8. Развёртывание и интеграция с service.sh
+## 10. Priority research questions
 
-### Ручная загрузка и проверка
+### P0 — `radiotap0` TX/RX path
 
-```bash
-adb push out/wonder_mosey_wild.ko /data/local/tmp/
-adb shell su -c 'insmod /data/local/tmp/wonder_mosey_wild.ko'
+Determine exactly how the registered `radiotap0` netdev connects to the DHD monitor implementation.
 
-# Проверка:
-adb shell dmesg | grep wonder_mosey_wild
-# Ожидаемое: wonder_mosey_wild: phy2  MAC=6a:b0:5d:c7:27:3d  →  iw phy phy2 set name wonder
+The target chain is:
 
-# Переименование phy:
-WPHY=$(adb shell su -c 'cat /sys/module/wonder_mosey_wild/parameters/phy_index')
-adb shell su -c "iw phy phy${WPHY} set name wonder"
+```text
+radiotap0
+  ↓
+netdev_ops / ndo_start_xmit
+  ↓
+DHD-MON TX handler
+  ↓
+DHD TX path
+  ↓
+BCM4398 firmware
 ```
 
-### Блок для service.sh
+For RX, establish the reverse path.
 
-Добавить **перед** запуском mosey_server:
+This is the highest-value question because a positive result would establish a realistic existing RF backend for a future Wonder adapter.
 
-```sh
-WONDER_KO="$MODDIR/system/vendor/lib/modules/wonder_mosey_wild.ko"
-if [ -f "$WONDER_KO" ]; then
-    insmod "$WONDER_KO"
-    /system/bin/sleep 1
-    WPHY=$(cat /sys/module/wonder_mosey_wild/parameters/phy_index 2>/dev/null)
-    if [ -n "$WPHY" ] && [ "$WPHY" -ge 0 ] 2>/dev/null; then
-        iw phy phy${WPHY} set name wonder
-    fi
-fi
+### P1 — Native Wonder provider
+
+Search the extracted `bcmdhd4398.ko` for:
+
+```text
+wondertap
+auxiliary_device
+auxiliary_driver
+wondertap_ops
+wondertap_aux_dev
 ```
 
-> **Предупреждение Wild KSU**: исполнитель `service.sh` в Wild KSU удаляет
-> строки, содержащие только символ `#` (комментарии), перед запуском скрипта.
-> Не добавляйте строки, состоящие исключительно из комментария.
+and inspect symbol relationships rather than relying only on strings.
 
-### Параметры модуля
+### P2 — Action Frame capability limits
 
-| Параметр | По умолчанию | Описание |
-|----------|--------------|----------|
-| `mac_addr` | `6a:b0:5d:c7:27:3d` | MAC-адрес, возвращаемый NL80211 vendor subcmd 5. Должен быть locally-administered (бит U/L установлен). |
-| `phy_index` | только чтение | Индекс phy, назначенный cfg80211. Читается через `/sys/module/wonder_mosey_wild/parameters/phy_index` для вызова `iw phy phyN set name wonder`. |
+Determine whether the existing cfg80211 Action Frame path can carry the exact 802.11 management/action frames required by the Wonder/AirDrop implementation, including channel, dwell-time and firmware restrictions.
 
-Пример с пользовательским MAC:
+### P3 — Firmware / iovar interface
 
-```bash
-insmod wonder_mosey_wild.ko mac_addr=02:ab:cd:ef:12:34
-```
+Map the monitor and action-frame functions to the underlying Broadcom ioctl/iovar interface and identify what the firmware actually accepts.
+
+### P4 — Mosey ↔ lower transport integration
+
+Only after the RF path is understood should `mosey_server` / Phenotype / service integration be modified.
+
+### P5 — AirDrop wire protocol
+
+In parallel, continue protocol work on:
+
+- discovery
+- authentication
+- channel establishment
+- transport/session setup
+- file transfer
+
+Protocol progress must remain separate from claims of transport success.
 
 ---
 
-## 9. Известные ограничения
+## 11. `nlmon0` and packet capture
 
-1. **Нет реального 802.11 RF на Pixel 7/8**: `wonder_mosey_wild.ko` создаёт
-   виртуальный phy. Интерфейс `wonder0` существует и init-последовательность
-   `mosey_server` завершается успешно, но реальные 802.11-фреймы не передаются
-   и не принимаются. Обнаружение устройств через 802.11-сканирование не
-   работает. BLE-обнаружение при этом не затрагивается.
+`nlmon0` is a high-value diagnostic tool for a **specific** Mosey / Quick Share transaction.
 
-2. **Частичное покрытие SELinux**: `sepolicy.rule` обеспечивает минимальный
-   набор правил для запуска mosey_server. Полная vendor CIL-политика из Pixel
-   10 ещё не интегрирована. Некоторые binder-вызовы или capabilities могут
-   молча не работать в enforcing-режиме.
+It can be used to capture and compare:
 
-3. **Источник бинарника mosey_server**: Бинарник необходимо самостоятельно
-   извлечь из factory-образа vendor Pixel 10. В этом модуле он не
-   распространяется.
+- nl80211 operations
+- vendor commands
+- `NL80211_CMD_FRAME`
+- NAN operations
+- channel changes
 
-4. **BCM4389 wondertap**: Wonder.ko для ядра 5.10 или 5.15 не существует ни в
-   одном публичном репозитории. Это фундаментальный блокиратор для нативного
-   подхода с BCM4389. Автономный `wonder_mosey_wild.ko` — единственный
-   реальный обходной путь.
+Do not run long-lived captures without a concrete test scenario.
 
-5. **Play Integrity**: Не подделывайте `Build.DEVICE` или `Build.MODEL` в
-   `blazer` (Pixel 10). TrickyStore + PlayIntegrityFork должны оставаться
-   нетронутыми.
+The highest-value comparison remains:
 
-6. **Не-Pixel устройства**: Теоретически применимо к любому Android-телефону с
-   KSU/Magisk. Бинарник mosey_server и SELinux-политика являются Pixel-нативными;
-   поведение на устройствах других производителей не тестировалось и может
-   потребовать дополнительной адаптации vendor-политики.
+```text
+working native platform
+        vs.
+Pixel 8 Pro implementation
+```
+
+with particular attention to the complete control-plane and transport sequence.
+
+---
+
+## 12. Development and safety policy
+
+Until the hardware path is understood:
+
+- prefer read-only inspection
+- use `/data/local/tmp` for temporary files
+- prefer temporary `insmod` only after ABI validation
+- use KernelSU modules for reversible integration
+- avoid direct boot / vendor_boot modifications
+- avoid persistent vendor partition modification
+- never auto-load an unverified `.ko`
+
+### `.ko` loading requirements
+
+No kernel module should be loaded merely because its filename or reported target version looks correct.
+
+Before any load decision, verify:
+
+1. exact running kernel version
+2. module `vermagic`
+3. relevant kernel configuration
+4. required exported symbols / symbol versions
+5. KCFI / MODVERSIONS compatibility where applicable
+6. ABI assumptions in the module
+7. rollback method
+
+An unverified kernel module can cause driver failure, kernel panic or a bootloop.
+
+---
+
+## 13. Current milestone status
+
+| Milestone | Status |
+|---|---|
+| Understand target device | ✅ |
+| Confirm BCM4398 / bcmdhd4398 | ✅ |
+| Confirm `radiotap0` exists | ✅ |
+| Confirm `aware_nmi0` exists | ✅ |
+| Confirm BCM4398 monitor/radiotap code | ✅ |
+| Confirm BCM4398 Action Frame TX/RX code | ✅ |
+| Confirm BCM4398 NAN implementation | ✅ |
+| Prove `radiotap0` reaches firmware TX | ⏳ |
+| Prove `radiotap0` receives firmware RX | ⏳ |
+| Prove WonderTap/native Wonder provider | ⏳ |
+| Connect generic Wonder to BCM4398 | ⏳ |
+| Mosey discovery with real transport | ⏳ |
+| Pixel ↔ iPhone authentication/channel | ⏳ |
+| Pixel → iPhone file transfer | ⏳ |
+| iPhone → Pixel file transfer | ⏳ |
+| Native-like user experience | ⏳ |
+
+---
+
+## 14. Next binary-analysis target
+
+The next file to analyze is the **stock driver binary already extracted from the device**:
+
+```text
+bcmdhd4398.ko
+```
+
+Use this exact local file for the first pass:
+
+```text
+/Users/patrick/Downloads/bcmdhd4398.ko
+```
+
+Do **not** substitute `wonder_mosey_wild.ko` for this investigation.
+
+Do **not** start by modifying the binary.
+
+The purpose of the next analysis is to recover the symbol-level path for:
+
+```text
+radiotap0
+  → monitor netdev ops
+  → TX/RX callbacks
+  → DHD monitor functions
+  → DHD protocol/bus TX/RX
+```
+
+The 16K variant is a separate binary and should be analyzed only after the standard binary path has been mapped.
+
+---
+
+## 15. Primary research references
+
+- Google Android common Wonder source: `drivers/android/wonder/`
+- Google WonderTap interface: `include/linux/android/wondertap.h`
+- Google BCM4398 source tree: `kernel/google-modules/wlan/bcmdhd/bcm4398`
+- `mosey-extended` upstream: `thelok1s/mosey-extended`
+- PR #8: `BasGame1/mosey-p8a`
+
+This README is intentionally a **research log and engineering specification**, not a compatibility claim.
+
+When new evidence conflicts with an earlier conclusion, update the conclusion explicitly and record what changed.
